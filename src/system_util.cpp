@@ -216,20 +216,56 @@ HANDLE SystemUtil::ExecuteCommandWithOutResultAsync (const std::string &command)
   return pi.hProcess;
 }
 
+static bool CreateOverlappedReadPipe (HANDLE *outRead, HANDLE *outWrite)
+{
+  static volatile LONG counter = 0;
+
+  std::string pipeName = "\\\\.\\pipe\\cubrid_exec_"
+			 + std::to_string (GetCurrentProcessId()) + "_"
+			 + std::to_string (GetTickCount()) + "_"
+			 + std::to_string (InterlockedIncrement (&counter));
+
+  SECURITY_ATTRIBUTES saRead;
+  saRead.nLength = sizeof (saRead);
+  saRead.bInheritHandle = FALSE;
+  saRead.lpSecurityDescriptor = NULL;
+
+  HANDLE hRead = CreateNamedPipeA (pipeName.c_str(),
+				   PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+				   PIPE_TYPE_BYTE | PIPE_WAIT,
+				   1, 8192, 8192, 0, &saRead);
+  if (hRead == INVALID_HANDLE_VALUE)
+    {
+      return false;
+    }
+
+  SECURITY_ATTRIBUTES saWrite;
+  saWrite.nLength = sizeof (saWrite);
+  saWrite.bInheritHandle = TRUE;
+  saWrite.lpSecurityDescriptor = NULL;
+
+  HANDLE hWrite = CreateFileA (pipeName.c_str(), GENERIC_WRITE, 0, &saWrite,
+			       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (hWrite == INVALID_HANDLE_VALUE)
+    {
+      CloseHandle (hRead);
+      return false;
+    }
+
+  *outRead = hRead;
+  *outWrite = hWrite;
+  return true;
+}
+
 std::string SystemUtil::ExecuteCommandWithTimeout (const std::string &command, DWORD timeoutMs)
 {
-  SECURITY_ATTRIBUTES sa;
-  sa.nLength = sizeof (SECURITY_ATTRIBUTES);
-  sa.bInheritHandle = TRUE;
-  sa.lpSecurityDescriptor = NULL;
+  HANDLE hReadPipe = INVALID_HANDLE_VALUE;
+  HANDLE hWritePipe = INVALID_HANDLE_VALUE;
 
-  HANDLE hReadPipe, hWritePipe;
-  if (!CreatePipe (&hReadPipe, &hWritePipe, &sa, 0))
+  if (!CreateOverlappedReadPipe (&hReadPipe, &hWritePipe))
     {
       return "";
     }
-
-  SetHandleInformation (hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
   STARTUPINFOA si;
   PROCESS_INFORMATION pi;
@@ -252,29 +288,77 @@ std::string SystemUtil::ExecuteCommandWithTimeout (const std::string &command, D
 
   CloseHandle (hWritePipe);
 
-  std::string result;
-  std::thread reader ([&hReadPipe, &result]
-  {
-    char buffer[4096];
-    DWORD bytesRead = 0;
-    while (ReadFile (hReadPipe, buffer, sizeof (buffer) - 1, &bytesRead, NULL) && bytesRead > 0)
-      {
-	buffer[bytesRead] = '\0';
-	result += buffer;
-      }
-  });
+  OVERLAPPED ov;
+  ZeroMemory (&ov, sizeof (ov));
+  ov.hEvent = CreateEvent (NULL, TRUE, FALSE, NULL); // manual-reset
+  if (ov.hEvent == NULL)
+    {
+      TerminateProcess (pi.hProcess, 1);
+      CloseHandle (pi.hProcess);
+      CloseHandle (pi.hThread);
+      CloseHandle (hReadPipe);
+      return "";
+    }
 
-  bool timedOut = (WaitForSingleObject (pi.hProcess, timeoutMs) == WAIT_TIMEOUT);
+  std::string result;
+  bool timedOut = false;
+  ULONGLONG deadline = GetTickCount64() + timeoutMs;
+
+  for (;;)
+    {
+      char buffer[4096];
+      DWORD bytesRead = 0;
+
+      ResetEvent (ov.hEvent);
+      BOOL ok = ReadFile (hReadPipe, buffer, sizeof (buffer), &bytesRead, &ov);
+
+      if (!ok && GetLastError() == ERROR_IO_PENDING)
+	{
+	  ULONGLONG now = GetTickCount64();
+	  DWORD wait = (now >= deadline) ? 0 : (DWORD) (deadline - now);
+
+	  if (WaitForSingleObject (ov.hEvent, wait) != WAIT_OBJECT_0)
+	    {
+	      CancelIoEx (hReadPipe, &ov);
+	      GetOverlappedResult (hReadPipe, &ov, &bytesRead, TRUE);
+	      timedOut = true;
+	      break;
+	    }
+
+	  if (!GetOverlappedResult (hReadPipe, &ov, &bytesRead, FALSE))
+	    {
+	      break;
+	    }
+	}
+      else if (!ok)
+	{
+	  break;
+	}
+
+      if (bytesRead == 0)
+	{
+	  break; // EOF
+	}
+
+      result.append (buffer, bytesRead);
+
+      if (GetTickCount64() >= deadline)
+	{
+	  timedOut = true;
+	  break;
+	}
+    }
+
   if (timedOut)
     {
       TerminateProcess (pi.hProcess, 1);
     }
 
-  reader.join();
-
+  CloseHandle (ov.hEvent);
   CloseHandle (pi.hProcess);
   CloseHandle (pi.hThread);
   CloseHandle (hReadPipe);
+
   return timedOut ? std::string() : result;
 }
 
